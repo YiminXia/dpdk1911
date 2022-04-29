@@ -996,7 +996,6 @@ static int udp_server_entry(__attribute__((unused))  void *arg) {
     localaddr.sin_port = htons(8899);
     localaddr.sin_family = AF_INET;
     localaddr.sin_addr.s_addr = inet_addr("10.164.16.40"); // 0.0.0.0
-    
 
     nbind(connfd, (struct sockaddr*)&localaddr, sizeof(localaddr));
 
@@ -1480,6 +1479,47 @@ static int ng_tcp_out(struct rte_mempool *mbuf_pool) {
     }
     return 0;
 }
+
+#define BUFFER_SIZE 1024
+static int tcp_server_entry(__attribute__((unused)) void *arg) {
+    // step1：socket;这里面其实是kernel创建一个stream结构体,返回其中的fd
+    int listenfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listenfd == -1) {
+        return -1;
+    }
+    // step2: bind;就是将一个stream与一个sockaddr_in建立联系
+    struct sockaddr_in servaddr; // struct sockaddr 
+    memset(&servaddr, 0, sizeof(struct sockaddr_in));
+
+    servaddr.sin_family = AF_INET;
+        //servaddr.sin_addr.s_addr = inet_addr("10.164.16.40"); // 0.0.0.0
+    servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
+    servaddr.sin_port = htons(8899);
+    bind(listenfd, (struct sockaddr*)&servaddr, sizeof(servaddr));
+
+    // step3: listen;监听
+    listen(listenfd, 10);
+
+    // step4: accept; accept返回一个客户端，并开始接收跟发送消息
+    struct sockadrr_in client;
+    socklen_t len = sizeof(client);
+    int connfd = accept(listenfd, (struct sockaddr*)&client, &len);
+
+    char buff[BUFFER_SIZE] = {0};
+    while(1) {
+        int n = recv(connfd, buff, BUFFER_SIZE, 0); // block
+        if (n > 0) { //接收成功
+            send(connfd, buff, n, 0);
+        } else if (n == 0) { //断开
+            close(connfd);
+        } else { // nonblock
+            
+        }
+    }
+    close(listenfd);
+}
+
+
 
 #endif
 
