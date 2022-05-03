@@ -13,6 +13,7 @@
 #include "arp.h"
 
 #define ENABLE_SEND         1
+
 #define ENABLE_ARP          1
 #define ENABLE_ICMP         1
 #define ENABLE_ARP_REPLY    1
@@ -566,6 +567,7 @@ struct localhost { //
     uint16_t localport;
 
     uint8_t protocol;
+/*******4+4+6+2+1=17-byte******************************/
 
     struct rte_ring *sndbuf;
     struct rte_ring *rcvbuf;
@@ -581,12 +583,39 @@ struct localhost { //
 static struct localhost *lhost = NULL;
 
 #define DEFAULT_FD_NUM  3
+#define MAX_FD_COUNT    1024
+static unsigned char fd_table[MAX_FD_COUNT] = {0};
 
 static int get_fd_frombitmap(void) {
 
     int fd = DEFAULT_FD_NUM;
-    return fd;
-    
+    for(; fd < MAX_FD_COUNT; fd++) {
+        if((fd_table[fd/8] & (0x1 << (fd % 8))) == 0) {
+            fd_table[fd/8] |= (0x1 << (fd % 8));
+            return fd;
+        }
+    }
+    return -1;
+}
+
+static int set_fd_frombitmap(int fd) {
+    if (fd >= MAX_FD_COUNT) {
+        return -1;
+    }
+    fd_table[fd/8] &= ~(0x1 << (fd % 8));
+    return 0;
+}
+
+static ng_tcp_stream *get_accept_tcb(uint16_t dport) {
+    struct ng_tcp_stream *apt;
+    struct ng_tcp_table *table = tcpInstance();
+
+    for(apt = table->tcp_set; apt != NULL; apt = apt->next) {
+        if(apt->dport == dport && apt->fd == -1) {
+            return apt;
+        }
+    }
+    return NULL;
 }
 
 static void * get_hostinfo_fromfd(int sockfd) {
@@ -817,7 +846,7 @@ static int udp_out(struct rte_mempool *mbuf_pool) {
 }
 
 // hook
-
+// nsocket both in udpserver and tcpserver
 static int nsocket(__attribute__((unused)) int domain, int type, __attribute__((unused))  int protocol) {
 
     int fd = get_fd_frombitmap(); //
@@ -866,7 +895,14 @@ static int nsocket(__attribute__((unused)) int domain, int type, __attribute__((
         stream->fd = fd;
         stream->proto = IPPROTO_TCP;
         stream->next = stream->prev = NULL;
+        // 加入的accept的阻塞机制
+        pthread_cond_t blank_cond = PTHREAD_COND_INITIALIZER;
+        rte_memcpy(&stream->cond, &blank_cond, sizeof(pthread_cond_t));
 
+        pthread_mutex_t blank_mutex = PTHREAD_MUTEX_INITIALIZER;
+        rte_memcpy(&stream->mutex, &blank_mutex, sizeof(pthread_mutex_t));
+
+#if 0
         stream->rcvbuf = rte_ring_create("tcp recv buff", RING_SIZE, rte_socket_id(), RING_F_SP_ENQ | RING_F_SC_DEQ);
         if(stream->rcvbuf == NULL) {
             rte_free(stream);
@@ -879,7 +915,7 @@ static int nsocket(__attribute__((unused)) int domain, int type, __attribute__((
             rte_free(stream);
             return -1;
         }
-
+#endif
         //阻塞代码
         // 加入到table里面是不合适的，因为此时通过五元组是找不到这个stream的，
         struct ng_tcp_table *table = tcpInstance();
@@ -888,20 +924,177 @@ static int nsocket(__attribute__((unused)) int domain, int type, __attribute__((
     }
     return fd;
 }
-
+// nbind both in udpserver and tcpserver
 static int nbind(int sockfd, const struct sockaddr *addr,
                 __attribute__((unused))  socklen_t addrlen) {
 
-    struct localhost *host =  get_hostinfo_fromfd(sockfd);
-    if (host == NULL) return -1;
+    void *hostinfo =  get_hostinfo_fromfd(sockfd);
+    if (hostinfo == NULL) return -1;
 
-    const struct sockaddr_in *laddr = (const struct sockaddr_in *)addr;
-    host->localport = laddr->sin_port;
-    rte_memcpy(&host->localip, &laddr->sin_addr.s_addr, sizeof(uint32_t));
-    rte_memcpy(host->localmac, gSrcMac, RTE_ETHER_ADDR_LEN);
+    struct localhost *host = (struct localhost *)hostinfo;
+
+    if (host->protocol == IPPROTO_UDP) {
+        const struct sockaddr_in *laddr = (const struct sockaddr_in *)addr;
+        host->localport = laddr->sin_port;
+        rte_memcpy(&host->localip, &laddr->sin_addr.s_addr, sizeof(uint32_t));
+        rte_memcpy(host->localmac, gSrcMac, RTE_ETHER_ADDR_LEN);
+    } else if (host->protocol == IPPROTO_TCP) {
+        struct ng_tcp_stream *stream = (struct ng_tcp_stream *)hostinfo;
+
+        const struct sockaddr_in *laddr = (const struct sockaddr_in *)addr;
+        stream->dport = laddr->sin_port;
+        rte_memcpy(&stream->dip, &laddr->sin_addr.s_addr, sizeof(uint32_t));
+        rte_memcpy(stream->localmac, gSrcMac, RTE_ETHER_ADDR_LEN);
+
+        stream->status = NG_TCP_STATUS_CLOSED;//这里抄CSAPP里面
+    }
 
     return 0;
 
+}
+
+// nlisten just in tcpserver,
+int nlisten(int sockfd, __attribute__((unused)) int backlog) {
+
+    //step1: 通过入参的sockfd找到stream
+    void *hostinfo = get_hostinfo_fromfd(sockfd);
+    if (hostinfo == NULL) {
+        return -1;
+    }
+    // step2: 把stream从主动变被动
+    struct ng_tcp_stream *stream = (struct ng_tcp_stream *)hostinfo;
+    if(stream->protocol == IPPROTO_TCP) {
+        stream->status = NG_TCP_STATUS_LISTEN;
+    }
+    // step3: 半连接+全连接 最大为backlog,
+    // 这里先将backlog设置成不可用的参数
+    return 0；
+}
+
+// naccept just in tcpserver里面运行，accept的阻塞，释放是在哪里呢，在ng_tcp_handle_syn_rcvd里面
+int naccept(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
+    //accept主要做两个事情，找到全连接节点stream，再给这个stream分配一个fd
+
+    void *hostinfo = get_hostinfo_fromfd(sockfd);
+    if(hostinfo == NULL)
+        return -1;
+
+    struct ng_tcp_stream *stream = (struct ng_tcp_stream *)hostinfo;
+    if (stream->protocol == IPPROTO_TCP) {
+        struct ng_tcp_stream *apt = NULL;
+
+        pthread_mutex_lock(&stream->mutex);
+        while((apt = get_accept_tcb(stream->dport)) == NULL) {
+            pthread_cond_wait(&stream->cond, &stream->mutex);
+        }
+        pthread_mutex_unlock(&stream->mutex);
+
+        apt->fd = get_fd_frombitmap();
+        saddr->sin_port = apt->sport;
+        struct sockaddr_in *saddr = (struct sockaddr_in *)addr;
+        rte_memcpy(&saddr->sin_addr.s_addr, &apt->sip, sizeof(uint32_t));
+
+        return apt->fd;
+    }
+
+    return -1;
+}
+
+ssize_t nsend(int sockfd, const void *buf, size_t len, int flags) {
+    ssize_t length = 0;
+
+    void *hostinfo = get_hostinfo_fromfd(sockfd);
+    if(hostinfo == NULL)
+        return -1;
+
+    struct ng_tcp_stream *stream = (struct ng_tcp_stream *)hostinfo;
+    if (stream->protocol == IPPROTO_TCP) {
+        // step1:组织一个tcp的fragment
+        struct ng_tcp_fragment *fragment = rte_malloc("ng_tcp_fragment", sizeof(struct ng_tcp_fragment), 0);
+        if (fragment == NULL) {
+            return -2;
+        }
+        
+        memset(fragment, 0, sizeof(struct ng_tcp_fragment));
+        fragment->dport = stream->sport;
+        fragment->sport = stream->dport;
+
+        fragment->acknum = stream->recv_nxt;
+        fragment->seqnum = stream->send_nxt;
+
+        fragment->tcp_flags = RTE_TCP_ACK_FLAG | RTE_TCP_PSH_FLAG;
+        fragment->windows = TCP_INITIAL_WINDOW;
+        fragment->hdrlen_off = 0x50;
+
+        //if(len > mtu)
+
+        //uint8_t *payload = (uint8_t *)tcphdr + hdrlen * 4;
+        fragment->data = rte_malloc("unsigned char *", len, 0);
+        if(fragment->data == NULL) {
+            printf("%s: %d rte_malloc failed\n", __func__, __LINE__);
+            return -1;
+        }
+        memset(fragment->data, 0, len+1);
+        
+        rte_memcpy(fragment->data, buf, len);
+        fragment->length = len;
+        length = fragment->length;
+        // step2：将fragment放到stream的sndbuf里面
+        // int nb_snd < 0,这里可以做一个判断，如果sndbuf满了就阻塞。
+        rte_ring_mp_enqueue(stream->sndbuf, fragment);
+        
+    }
+    return length;
+}
+
+
+//recv 运行在tcp server这个线程里面的
+// real world中，recv返回三类值，>0是正常的，==0断开，<0即==-1代表stream->recvbuf是空的，也就是recv非阻塞模式
+// recv阻塞模式是没有返回-1这种说法的。
+ssize_t nrecv(int sockfd, void *buf, size_t len, int flags) {
+
+    ssize_t length = 0;
+
+    void *hostinfo = get_hostinfo_fromfd(sockfd);
+    if(hostinfo == NULL)
+        return -1;
+
+    struct ng_tcp_stream *stream = (struct ng_tcp_stream *)hostinfo;
+    if (stream->protocol == IPPROTO_TCP) {
+
+        struct ng_tcp_fragment *fragment = NULL;
+        int nb_rcv = 0;
+
+        // step1: recv从stream->rcvbuf里面取数据，没有数据就条件等待。等tcp_process往里加数据
+        pthread_mutex_lock(&stream->mutex);
+        while((nb_rcv = rte_ring_mc_dequeue(stream->rcvbuf, (void **)&fragment)) < 0) {
+            // 如果nb_rcv < 0代表没有收到包，此时我们进行条件等待，就是阻塞
+            pthread_cond_wait(&stream->cond, &stream->mutex)
+        }
+        pthread_mutex_unlock(&stream->mutex);
+
+        if(fragment->length > len) {
+            rte_memcpy(buf, fragment->data, len);
+            int i = 0;
+            for(i = 0; i < fragment->length-len; i++) {
+                fragment->data[i] = fragment->data[len+i];
+            }
+            fragment->length = fragment->length - len;
+            length = len; // 这里视频里面写错了把
+            rte_ring_mp_enqueue(stream->rcvbuf, fragment);
+        } else if(fragment->length == 0) {
+            rte_free(fragment);
+            return 0;
+        } else {
+            rte_memcpy(buf, fragment->data, fragment->length);
+            length = fragment->length;
+            rte_free(fragment->data);
+            fragment->data = NULL;
+            // 这里回忆一下，fragment是在tcp_process往stream->rcvbuf里面加的时候，生产的
+            rte_free(fragment);
+        }
+    }
+    return length;
 }
 
 static ssize_t nrecvfrom(int sockfd, void *buf, size_t len, __attribute__((unused))  int flags,
@@ -990,30 +1183,51 @@ static ssize_t nsendto(int sockfd, const void *buf, size_t len, __attribute__((u
 
     return len;
 }
-
+// nclose之所以加n是为了避免与系统重名，当然DPDK还可以用hook方法，比如pthread_mutex_unlock这种就是hook做的
 static int nclose(int fd) {
 
-    struct localhost *host =  get_hostinfo_fromfd(fd);
-    if (host == NULL) return -1;
+    void *hostinfo = get_hostinfo_fromfd(fd);
+    if(hostinfo == NULL)
+        return -1;
 
-    LL_REMOVE(host, lhost);
+    struct localhost *host =  (struct localhost *)hostinfo;
+    if(host->protocol == IPPROTO_UDP) {
+        LL_REMOVE(host, lhost);
+        if (host->rcvbuf) {
+            rte_ring_free(host->rcvbuf);
+        }
+        if (host->sndbuf) {
+            rte_ring_free(host->sndbuf);
+        }
+        rte_free(host);
+        set_fd_frombitmap(fd);
+    } else if(host->protocol == IPPROTO_TCP) {
+        struct ng_tcp_stream *stream = (struct ng_tcp_stream *)hostinfo;
+        // 准备一个tcp fragment
+        struct ng_tcp_fragment *fragment = rte_malloc("ng_tcp_fragment", sizeof(struct ng_tcp_fragment), 0);
+        if(fragment == NULL) {
+            return -1;
+        }
+        fragment->data = NULL;
+        fragment->length = 0;
+        fragment->sport = stream->dport;
+        fragment->dport = stream->sport;
 
-    if (host->rcvbuf) {
-        rte_ring_free(host->rcvbuf);
+        fragment->seqnum = stream->send_nxt;
+        fragment->acknum = stream->recv_nxt;
+
+        fragment->tcp_flags = RTE_TCP_FIN_FLAG;
+        fragment->windows = TCP_INITIAL_WINDOW;
+        fragment->hdrlen_off = 0x50;
+
+        rte_ring_mp_enqueue(stream->sndbuf, fragment);
+        // 发送完了之后status状态更新
+        stream->status = NG_TCP_STATUS_LAST_ACK;
+
+        set_fd_frombitmap(fd);
     }
-    if (host->sndbuf) {
-        rte_ring_free(host->sndbuf);
-    }
-
-    rte_free(host);
     return 0;
 }
-
-
-
-
-
-
 
 #define UDP_APP_RECV_BUFFER_SIZE    128
 
@@ -1087,6 +1301,16 @@ typedef enum _NG_TCP_STATUS {
 struct ng_tcp_stream { // tcp control block，想成表示一个TCP连接的结构体, 这玩意跟localhost一个思想
 
     int fd;
+
+    uint32_t    dip;
+    uint8_t     localmac[RTE_ETHER_ADDR_LEN];
+    uint16_t    dport;  // 这个stream用来形容一个fd的？
+
+    uint8_t     protocol;
+/*********4+4+6+2+1 = 17-byte************************/
+    uint32_t    sip;
+    uint16_t    sport;
+#if 0 //这里因为get_hostinfo_fromfd函数的原因，需要打乱下顺序
 /************五元组*******************/
     uint32_t sip;
     uint32_t dip;
@@ -1095,7 +1319,7 @@ struct ng_tcp_stream { // tcp control block，想成表示一个TCP连接的结构体, 这玩意
     uint16_t proto;
 /*************mac地址******************/
     uint8_t localmac[RTE_ETHER_ADDR_LEN];
-
+#endif
 /*************收发包seq/ack number的字段*************/
     uint32_t send_nxt;
     uint32_t recv_nxt;
@@ -1110,6 +1334,10 @@ struct ng_tcp_stream { // tcp control block，想成表示一个TCP连接的结构体, 这玩意
 /*************维护连接的双向链表指针,实际生产环境使用红黑树等等*************/
     struct ng_tcp_stream *prev;
     struct ng_tcp_stream *next;
+
+/******************************************************/
+    pthread_cond_t cond;
+    pthread_mutex_t mutex;
 };
 
 struct ng_tcp_table {
@@ -1160,9 +1388,15 @@ static struct ng_tcp_table *tcpInstance(void) {
 static struct ng_tcp_stream * ng_tcp_stream_search(uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport){
     struct ng_tcp_table *table = tcpInstance();
     struct ng_tcp_stream *iter;
-    for(iter = table->tcp_set; iter != NULL; iter=iter->next) {
+    for(iter = table->tcp_set; iter != NULL; iter=iter->next) { //established
         if(iter->sip == sip && iter->dip == dip && 
             iter->sport == sport && iter->dport == dport) {
+            return iter;
+        }
+    }
+
+    for(iter = table->tcp_set; iter != NULL; iter=iter->next) { // listen
+        if(iter->dport == dport && iter->status == NG_TCP_STATUS_LISTEN) {
             return iter;
         }
     }
@@ -1182,6 +1416,7 @@ static struct ng_tcp_stream * ng_tcp_stream_create(uint32_t sip, uint32_t dip, u
     stream->dport = dport;
     stream->proto = IPPROTO_TCP;
     stream->status = NG_TCP_STATUS_LISTEN;
+    stream->fd = -1// -1-> unused;
     //tcp 两个收发环
     stream->sndbuf = rte_ring_create("sndbuf", RING_SIZE, rte_socket_id(), 0);
     stream->rcvbuf = rte_ring_create("rcvbuf", RING_SIZE, rte_socket_id(), 0);
@@ -1190,6 +1425,14 @@ static struct ng_tcp_stream * ng_tcp_stream_create(uint32_t sip, uint32_t dip, u
     stream->send_nxt = rand_r(&next_seed) % TCP_MAX_SEQ;
     //把网卡的mac地址放进来，在create新包的时候用
     rte_memcpy(stream->localmac, gSrcMac, RTE_ETHER_ADDR_LEN);
+
+    // 加入accept阻塞机制
+    pthread_cond_t blank_cond = PTHREAD_COND_INITIALIZER;
+    rte_memcpy(&stream->cond, &blank_cond, sizeof(pthread_cond_t));
+
+    pthread_mutex_t blank_mutex = PTHREAD_MUTEX_INITIALIZER;
+    rte_memcpy(&stream->mutex, &blank_mutex, sizeof(pthread_mutex_t));
+    
     // 把新创建的stream加入tcp table中
     struct ng_tcp_table *table = tcpInstance();
     LL_ADD(stream, table->tcp_set);
@@ -1198,10 +1441,18 @@ static struct ng_tcp_stream * ng_tcp_stream_create(uint32_t sip, uint32_t dip, u
     return stream;
 }
 
-static int ng_tcp_handle_listen(struct ng_tcp_stream *stream, struct rte_tcp_hdr *tcphdr) {
+static int ng_tcp_handle_listen(struct ng_tcp_stream *stream, struct rte_tcp_hdr *tcphdr, struct rte_ipv4_hdr *iphdr) {
 
     if (tcphdr->tcp_flags & RTE_TCP_SYN_FLAG) {
         if(stream->status == NG_TCP_STATUS_LISTEN) {
+            // step1:创建一个半连接的节点 即创建一个stream，fd为-1
+            struct ng_tcp_stream *syn = ng_tcp_stream_create(iphdr->src_addr, iphdr->dst_addr, tcphdr->src_port, tcphdr->dst_port);
+            struct ng_tcp_table *table = tcpInstance();
+            LL_ADD(syn, table->tcp_set);
+            
+            // step2:返回一个ack包，
+            // 如果下一次再来一个syn，四元组已经存在，
+            // ng_tcp_stream_search直接就返回了
             struct ng_tcp_fragment *fragment = rte_malloc("ng_tcp_fragment", sizeof(struct ng_tcp_fragment), 0);
             if(fragment == NULL)
                 return -1;
@@ -1210,14 +1461,14 @@ static int ng_tcp_handle_listen(struct ng_tcp_stream *stream, struct rte_tcp_hdr
             fragment->sport = tcphdr->dst_port;
             fragment->dport = tcphdr->src_port;
             struct in_addr addr;
-            addr.s_addr = stream->sip;
+            addr.s_addr = syn->sip;
             printf("tcp---->src:%s:%d", inet_ntoa(addr), ntohs(tcphdr->src_port));
-            addr.s_addr = stream->dip;
+            addr.s_addr = syn->dip;
             printf("---> dst:%s:%d\n", inet_ntoa(addr), ntohs(tcphdr->dst_port));
 
-            fragment->seqnum = stream->send_nxt;
-            stream->recv_nxt = ntohl(tcphdr->sent_seq) + 1; //先ntoh再加一，因为最小端加一与最大端加一是不一样的。
-            fragment->acknum = stream->recv_nxt;
+            fragment->seqnum = syn->send_nxt;
+            syn->recv_nxt = ntohl(tcphdr->sent_seq) + 1; //先ntoh再加一，因为最小端加一与最大端加一是不一样的。
+            fragment->acknum = syn->recv_nxt;
 
             fragment->tcp_flags = (RTE_TCP_SYN_FLAG | RTE_TCP_ACK_FLAG);
             fragment->windows = TCP_INITIAL_WINDOW;
@@ -1227,9 +1478,9 @@ static int ng_tcp_handle_listen(struct ng_tcp_stream *stream, struct rte_tcp_hdr
             fragment->data = NULL;
             fragment->length = 0;
 
-            rte_ring_mp_enqueue(stream->sndbuf, fragment);
+            rte_ring_mp_enqueue(syn->sndbuf, fragment);
             //fragment配置完了之后，状态机进行状态跃迁
-            stream->status = NG_TCP_STATUS_SYN_RCVD;
+            syn->status = NG_TCP_STATUS_SYN_RCVD;
         }
     }
     return 0;
@@ -1243,10 +1494,89 @@ static int ng_tcp_handle_syn_rev(struct ng_tcp_stream *stream, struct rte_tcp_hd
                 //
             }
             stream->status = NG_TCP_STATUS_ESTABLISHED;
+
+            //结合accept函数来实现,如果这里搜索不到listenfd那么accept那里直接锁死出不来了
+            struct ng_tcp_stream *listenfd = ng_tcp_stream_search(0, 0, 0, stream->dport);
+            if(listenfd == NULL) {
+                printf("ng_tcp_stream_search listenfd failed");
+                rte_exit(EXIT_FAILURE, "search listenfd failed\n");
+            }
+            pthread_mutex_lock(&listenfd->mutex);
+            pthread_cond_signal(&listenfd->cond);
+            pthread_mutex_unlock(&listenfd->mutex);
         }
     }
     return 0;
 }
+
+static int ng_tcp_enqueue_recvbuff(struct ng_tcp_stream *stream, struct rte_tcp_hdr *tcphdr, int tcplen) {
+    struct ng_tcp_fragment *rfragment = rte_malloc("ng_tcp_fragment", sizeof(struct ng_tcp_fragment), 0);
+    if(rfragment == NULL) {
+        printf("%s:%d rte_malloc failed\n", __func__, __LINE__);
+        return -1;
+    }
+    memset(rfragment, 0, sizeof(struct ng_tcp_fragment));
+
+    rfragment->dport = ntohs(tcphdr->dst_port);
+    rfragment->sport = ntohs(tcphdr->src_port);
+
+    uint8_t hdrlen = tcphdr->data_off >> 4;
+    int payloadlen = tcplen - hdrlen * 4;
+
+    if(payloadlen > 0) {
+        // sizeof(struct rte_tcp_hdr)是固定值20字节，不包括option的长度
+        uint8_t *payload = (uint8_t *)tcphdr + hdrlen * 4;
+        rfragment->data = rte_malloc("unsigned char *", payloadlen+1, 0);
+        if(rfragment->data == NULL) {
+            printf("%s:%d rte_malloc failed\n", __func__, __LINE__);
+            rte_free(rfragment);
+            return -1;
+        }
+        
+        memset(rfragment->data, 0, payloadlen+1);//多一个字节存\0
+        rte_memcpy(rfragment->data, payload, payloadlen);
+        rfragment->length = payloadlen;
+        printf("%s:%d: tcp: %s\n", __func__, __LINE__, rfragment->data);
+    } else if(payloadlen == 0) {
+        rfragment->length = 0;
+        rfragment->data = NULL;
+    }
+    rte_ring_mp_enqueue(stream->rcvbuf, rfragment);//这里不能够free(rfragment);等posix api读取了之后再free
+    return 0;
+}
+
+static int ng_tcp_send_ackpkt(struct ng_tcp_stream *stream, struct rte_tcp_hdr *tcphdr) {
+    struct ng_tcp_fragment *ackfrag = rte_malloc("ng_tcp_fragment", sizeof(struct ng_tcp_fragment), 0);
+    if(ackfrag == NULL) {
+        printf("%s:%d rte_malloc failed\n", __func__, __LINE__);
+        return -1;
+    }
+    memset(ackfrag, 0, sizeof(struct ng_tcp_fragment));
+
+    ackfrag->sport = tcphdr->dst_port;
+    ackfrag->dport = tcphdr->src_port;
+
+    //stream->recv_nxt;//对端发的数据包的next id是多少
+    //stream->send_nxt;//本端发的数据包的next id是多少
+    if(stream->recv_nxt != ntohs(tcphdr->sent_seq)) { //出现dup ack
+
+    }
+    stream->recv_nxt += 1;
+    stream->send_nxt = ntohl(tcphdr->recv_ack);
+
+    ackfrag->acknum = stream->recv_nxt;
+    ackfrag->seqnum = stream->send_nxt;
+
+    ackfrag->tcp_flags = RTE_TCP_ACK_FLAG;
+    ackfrag->windows = TCP_INITIAL_WINDOW;
+    ackfrag->hdrlen_off = 0x50;
+    ackfrag->data = NULL;
+    ackfrag->length= 0;
+    rte_ring_mp_enqueue(stream->sndbuf, ackfrag);
+    return 0;
+}
+
+
 
 static int ng_tcp_handle_established(struct ng_tcp_stream *stream, struct rte_tcp_hdr *tcphdr, int tcplen) {
     
@@ -1256,6 +1586,7 @@ static int ng_tcp_handle_established(struct ng_tcp_stream *stream, struct rte_tc
     if(tcphdr->tcp_flags & RTE_TCP_PSH_FLAG) {
         //服务端在收到PSH包之后，会产生三个包，回复的ACK包，推给应用程序的数据包，回复的数据包
         //1 下面是要推给应用程序的包，甩给tcp posix api接口中的rcv_buff
+#if 0
         struct ng_tcp_fragment *rfragment = rte_malloc("ng_tcp_fragment", sizeof(struct ng_tcp_fragment), 0);
         if(rfragment == NULL) {
             printf("%s:%d rte_malloc failed\n", __func__, __LINE__);
@@ -1285,8 +1616,11 @@ static int ng_tcp_handle_established(struct ng_tcp_stream *stream, struct rte_tc
             printf("%s:%d: tcp: %s\n", __func__, __LINE__, rfragment->data);
         }
         rte_ring_mp_enqueue(stream->rcvbuf, rfragment);//这里不能够free(rfragment);等posix api读取了之后再free
-
+#else
+        ng_tcp_enqueue_recvbuff(stream, tcphdr, tcplen);
+#endif
         //2 ack pkt,这个包是要发给对端的，所以sport是本地的port，dport是对端的ip
+#if 0
         struct ng_tcp_fragment *ackfrag = rte_malloc("ng_tcp_fragment", sizeof(struct ng_tcp_fragment), 0);
         if(ackfrag == NULL) {
             printf("%s:%d rte_malloc failed\n", __func__, __LINE__);
@@ -1314,8 +1648,16 @@ static int ng_tcp_handle_established(struct ng_tcp_stream *stream, struct rte_tc
         ackfrag->data = NULL;
         ackfrag->length= 0;
         rte_ring_mp_enqueue(stream->sndbuf, ackfrag);
+#else
+        uint8_t hdrlen = tcphdr->data_off >> 4;
+        int payloadlen = tcplen - hdrlen * 4;
+        stream->recv_nxt += payloadlen;
+        stream->send_nxt = ntohl(tcphdr->recv_ack);
+        ng_tcp_send_ackpkt(stream, tcphdr);
+#endif
 
-        //3 echo pkt
+        //3 echo pkt,这一步已经没有意义了
+#if 0
         struct ng_tcp_fragment *echofrag = rte_malloc("ng_tcp_fragment", sizeof(struct ng_tcp_fragment), 0);
         if(echofrag == NULL) {
             printf("%s: %d rte_malloc failed\n", __func__, __LINE__);
@@ -1343,14 +1685,51 @@ static int ng_tcp_handle_established(struct ng_tcp_stream *stream, struct rte_tc
         rte_memcpy(echofrag->data, payload, payloadlen);
         echofrag->length = payloadlen;
         rte_ring_mp_enqueue(stream->sndbuf, echofrag);
+#endif
     }
     if(tcphdr->tcp_flags & RTE_TCP_ACK_FLAG) {
 
     }
     if(tcphdr->tcp_flags & RTE_TCP_FIN_FLAG) {
         stream->status = NG_TCP_STATUS_CLOSE_WAIT;
+        // 当处于established状态时候收到fin包，也会产生两个数据，一个抛给应用层，一个返回ack
+        // make a rfragment to tcp server app
+#if 0
+        struct ng_tcp_fragment *rfragment = rte_malloc("ng_tcp_fragment", sizeof(struct ng_tcp_fragment), 0);
+        if(rfragment == NULL) {
+            printf("%s:%d rte_malloc failed\n", __func__, __LINE__);
+            return -1;
+        }
+        memset(rfragment, 0, sizeof(struct ng_tcp_fragment));
 
+        rfragment->dport = ntohs(tcphdr->dst_port);
+        rfragment->sport = ntohs(tcphdr->src_port);
+
+        uint8_t hdrlen = tcphdr->data_off >> 4;
+        int payloadlen = tcplen - hdrlen * 4;
+
+        rfragment->length = 0;
+        rfragment->data = NULL;
+        rte_ring_mp_enqueue(stream->rcvbuf, rfragment);//这里不能够free(rfragment);等posix api读取了之后再free
+#else
+        ng_tcp_enqueue_recvbuff(stream, tcphdr, tcphdr->data_off >> 4); //tcplen这里写错了把
+#endif
+        // send ack ptk
+        stream->recv_nxt += 1;
+        stream->send_nxt = ntohl(tcphdr->recv_ack);
+        ng_tcp_send_ackpkt(stream, tcphdr);
     }
+    return 0;
+}
+
+static ng_tcp_handle_close_wait(struct ng_tcp_stream *stream, struct rte_tcp_hdr *tcphdr, int tcplen)
+{
+    if(tcphdr->tcp_flags & RTE_TCP_FIN_FLAG) {
+        if(stream->status == NG_TCP_STATUS_CLOSE_WAIT) {
+            //避免重复的fin
+        }
+    }
+
     return 0;
 }
 
@@ -1370,12 +1749,17 @@ static int ng_tcp_process(struct rte_mbuf *tcpmbuf) {
         printf("cksum %x, tcp cksum %x\n", cksum, tcpcksum);
         return -1;
     }
-
+    // step2: tcp协议api实现之accept的实现
+    // 这里逻辑是这样的，先通过四元组找到stream（established的连接），
+    // 找不到再通过dport找listen的stream
     stream = ng_tcp_stream_search(iphdr->src_addr, iphdr->dst_addr, 
         tcphdr->src_port, tcphdr->dst_port);
     if(stream == NULL) {
+        /* 这里就不需要新创建stream了，
         stream = ng_tcp_stream_create(iphdr->src_addr, iphdr->dst_addr,
             tcphdr->src_port, tcphdr->dst_port);
+        */
+        return -2;
     }
     /****实现TCP连接的状态机，一个状态加一个回调函数，过滤器模式，责任链模式****/
     switch (stream->status) {
@@ -1383,7 +1767,7 @@ static int ng_tcp_process(struct rte_mbuf *tcpmbuf) {
             break;
 
         case NG_TCP_STATUS_LISTEN:          // 这种只存在于server
-            ng_tcp_handle_listen(stream, tcphdr);
+            ng_tcp_handle_listen(stream, tcphdr, iphdr);
             break;
 
         case NG_TCP_STATUS_SYN_RCVD:        // server
@@ -1488,6 +1872,8 @@ static struct rte_mbuf * ng_tcp_pkt(struct rte_mempool *mbuf_pool, uint32_t sip,
         ng_encode_tcp_apppkt(pktdata, sip, dip, srcmac, dstmac, fragment);
         return mbuf;
 }
+
+// ng_tcp_out负责从sndbuf里面取数据然后组包，之后再发给out ring
 static int ng_tcp_out(struct rte_mempool *mbuf_pool) {
     struct ng_tcp_table *table = tcpInstance();
     struct ng_tcp_stream *iter;
@@ -1581,17 +1967,10 @@ static int ng_tcp_api_bind(int sockfd, const struct sockaddr *addr,
     return 0;
 }
 
-static int ng_tcp_api_listen(int sockfd, int backlog) {
-
-
-
-}
-
-
 #define BUFFER_SIZE 1024
 static int tcp_server_entry(__attribute__((unused)) void *arg) {
     // step1：socket;这里面其实是kernel创建一个stream结构体,返回其中的fd
-    int listenfd = ng_tcp_api_socket(AF_INET, SOCK_STREAM, 0);
+    int listenfd = nsocket(AF_INET, SOCK_STREAM, 0);
     if (listenfd == -1) {
         return -1;
     }
@@ -1606,12 +1985,12 @@ static int tcp_server_entry(__attribute__((unused)) void *arg) {
     ng_tcp_api_bind(listenfd, (struct sockaddr*)&servaddr, sizeof(servaddr));
 
     // step3: listen;监听
-    listen(listenfd, 10);
+    nlisten(listenfd, 10);
 
     // step4: accept; accept返回一个客户端，并开始接收跟发送消息
     struct sockadrr_in client;
     socklen_t len = sizeof(client);
-    int connfd = accept(listenfd, (struct sockaddr*)&client, &len);
+    int connfd = naccept(listenfd, (struct sockaddr*)&client, &len);
 
     char buff[BUFFER_SIZE] = {0};
     while(1) {
@@ -1619,15 +1998,13 @@ static int tcp_server_entry(__attribute__((unused)) void *arg) {
         if (n > 0) { //接收成功
             send(connfd, buff, n, 0);
         } else if (n == 0) { //断开
-            close(connfd);
+            nclose(connfd);
         } else { // nonblock
             
         }
     }
-    close(listenfd);
+    nclose(listenfd);
 }
-
-
 
 #endif
 
