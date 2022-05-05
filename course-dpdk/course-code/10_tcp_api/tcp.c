@@ -411,12 +411,12 @@ static int pkt_process(void *arg) {
                 struct rte_arp_hdr *ahdr = rte_pktmbuf_mtod_offset(mbufs[i], 
                     struct rte_arp_hdr *, sizeof(struct rte_ether_hdr));
                 
-                struct in_addr addr;
-                addr.s_addr = ahdr->arp_data.arp_tip;
-                printf("arp ---> src: %s ", inet_ntoa(addr));
+                //struct in_addr addr;
+                //addr.s_addr = ahdr->arp_data.arp_tip;
+                //printf("arp ---> src: %s ", inet_ntoa(addr));
 
-                addr.s_addr = gLocalIp;
-                printf(" local: %s \n", inet_ntoa(addr));
+                //addr.s_addr = gLocalIp;
+                //printf(" local: %s \n", inet_ntoa(addr));
 
                 if (ahdr->arp_data.arp_tip == gLocalIp) {
                     if (ahdr->arp_opcode == rte_cpu_to_be_16(RTE_ARP_OP_REQUEST)) {
@@ -1058,7 +1058,7 @@ static ssize_t nrecv(int sockfd, void *buf, int len, __attribute__((unused))int 
     void *hostinfo = get_hostinfo_fromfd(sockfd);
     if(hostinfo == NULL)
         return -1;
-
+    printf("nrecv\n");
     struct ng_tcp_stream *stream = (struct ng_tcp_stream *)hostinfo;
     if (stream->protocol == IPPROTO_TCP) {
 
@@ -1069,6 +1069,7 @@ static ssize_t nrecv(int sockfd, void *buf, int len, __attribute__((unused))int 
         pthread_mutex_lock(&stream->mutex);
         while((nb_rcv = rte_ring_mc_dequeue(stream->rcvbuf, (void **)&fragment)) < 0) {
             // 如果nb_rcv < 0代表没有收到包，此时我们进行条件等待，就是阻塞
+            printf("nb_rcv < 0\n");
             pthread_cond_wait(&stream->cond, &stream->mutex);
         }
         pthread_mutex_unlock(&stream->mutex);
@@ -1218,7 +1219,7 @@ static int nclose(int fd) {
             fragment->seqnum = stream->send_nxt;
             fragment->acknum = stream->recv_nxt;
 
-            fragment->tcp_flags = RTE_TCP_FIN_FLAG;
+            fragment->tcp_flags = RTE_TCP_FIN_FLAG | RTE_TCP_ACK_FLAG;
             fragment->windows = TCP_INITIAL_WINDOW;
             fragment->hdrlen_off = 0x50;
 
@@ -1427,9 +1428,12 @@ static struct ng_tcp_stream * ng_tcp_stream_create(uint32_t sip, uint32_t dip, u
     stream->protocol = IPPROTO_TCP;
     stream->status = NG_TCP_STATUS_LISTEN;
     stream->fd = -1;// -1-> unused;
-    //tcp 两个收发环
+    // tcp 两个收发环
     stream->sndbuf = rte_ring_create("sndbuf", RING_SIZE, rte_socket_id(), 0);
     stream->rcvbuf = rte_ring_create("rcvbuf", RING_SIZE, rte_socket_id(), 0);
+    if(stream->sndbuf == NULL || stream->rcvbuf == NULL) {
+        printf("%s:%d: rte_ring_create failed\n", __func__, __LINE__);
+    }
     // tcp 的序列号,初始化是随机的
     uint32_t next_seed = time(NULL);
     stream->send_nxt = rand_r(&next_seed) % TCP_MAX_SEQ;
@@ -1489,7 +1493,8 @@ static int ng_tcp_handle_listen(struct ng_tcp_stream *stream, struct rte_tcp_hdr
             fragment->data = NULL;
             fragment->length = 0;
 
-            rte_ring_mp_enqueue(syn->sndbuf, fragment);
+            int ret_val = rte_ring_mp_enqueue(syn->sndbuf, fragment);
+            printf("%s:%d: ret_val is %d\n", __func__, __LINE__, ret_val);
             //fragment配置完了之后，状态机进行状态跃迁
             syn->status = NG_TCP_STATUS_SYN_RCVD;
         }
@@ -1748,7 +1753,7 @@ static int ng_tcp_handle_close_wait(struct ng_tcp_stream *stream, struct rte_tcp
 
     return 0;
 }
-
+// 使用net assistant做实验的时候，win10并没有回复第四次挥手
 static int ng_tcp_handle_last_ack(struct ng_tcp_stream *stream, struct rte_tcp_hdr *tcphdr) {
 
 	if (tcphdr->tcp_flags & RTE_TCP_ACK_FLAG) {
@@ -1973,6 +1978,28 @@ static int tcp_server_entry(__attribute__((unused)) void *arg) {
     nlisten(listenfd, 10);
 
     // step4: accept; accept返回一个客户端，并开始接收跟发送消息
+#if 0
+    while(1) {
+        struct sockaddr_in client;
+        socklen_t len = sizeof(client);
+        int connfd = naccept(listenfd, (struct sockaddr*)&client, &len);
+
+        char buff[BUFFER_SIZE] = {0};
+        while(1) {
+            int n = nrecv(connfd, buff, BUFFER_SIZE, 0); // block
+            printf("%s:%d: nrecv return %d\n", __func__, __LINE__, n);
+            if (n > 0) { //接收成功
+                printf("%s:%d: tcp: %s\n", __func__, __LINE__, buff);
+                nsend(connfd, buff, n, 0);
+            } else if (n == 0) { //断开
+                nclose(connfd);
+                break;
+            } else { // nonblock
+            
+            }
+        }
+    }
+#else
     struct sockaddr_in client;
     socklen_t len = sizeof(client);
     int connfd = naccept(listenfd, (struct sockaddr*)&client, &len);
@@ -1980,15 +2007,17 @@ static int tcp_server_entry(__attribute__((unused)) void *arg) {
     char buff[BUFFER_SIZE] = {0};
     while(1) {
         int n = nrecv(connfd, buff, BUFFER_SIZE, 0); // block
+        printf("%s:%d: nrecv return %d\n", __func__, __LINE__, n);
         if (n > 0) { //接收成功
             printf("%s:%d: tcp: %s\n", __func__, __LINE__, buff);
             nsend(connfd, buff, n, 0);
         } else if (n == 0) { //断开
             nclose(connfd);
         } else { // nonblock
-            
+        
         }
     }
+#endif 
     nclose(listenfd);
 }
 
