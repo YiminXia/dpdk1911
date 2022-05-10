@@ -946,7 +946,7 @@ static int nbind(int sockfd, const struct sockaddr *addr,
         rte_memcpy(&stream->dip, &laddr->sin_addr.s_addr, sizeof(uint32_t));
         rte_memcpy(stream->localmac, gSrcMac, RTE_ETHER_ADDR_LEN);
 
-        stream->status = NG_TCP_STATUS_CLOSED;//这里抄CSAPP里面
+        stream->status = NG_TCP_STATUS_CLOSED;//这里抄CSAPP里面关于bind函数的讲解
     }
 
     return 0;
